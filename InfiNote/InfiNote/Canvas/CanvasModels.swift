@@ -34,6 +34,7 @@ enum EditorTool: String, CaseIterable, Identifiable {
     case highlighter
     case eraser
     case lasso
+    case text
 
     var id: String { rawValue }
 
@@ -49,6 +50,8 @@ enum EditorTool: String, CaseIterable, Identifiable {
             return "Eraser"
         case .lasso:
             return "Lasso"
+        case .text:
+            return "Text"
         }
     }
 
@@ -64,15 +67,36 @@ enum EditorTool: String, CaseIterable, Identifiable {
             return nil
         case .lasso:
             return nil
+        case .text:
+            return nil
         }
     }
 }
 
-struct CanvasTextBox: Identifiable, Hashable {
+struct CanvasTextStyle: Hashable, Codable {
+    var fontPostScriptName: String
+    var fontSize: Float
+    var color: CanvasColor
+    var lineHeightMultiple: Float
+    var alignmentRawValue: Int
+
+    static let `default` = CanvasTextStyle(
+        fontPostScriptName: "Helvetica",
+        fontSize: 18,
+        color: .black,
+        lineHeightMultiple: 1.2,
+        alignmentRawValue: 0
+    )
+}
+
+struct CanvasTextBox: Identifiable, Hashable, Codable {
     var id: UUID
     var text: String
     var frame: StrokeBounds
     var rotation: Float
+    var style: CanvasTextStyle
+    var zIndex: Int
+    var isLocked: Bool
     var createdAtMillis: Int64
     var updatedAtMillis: Int64
 }
@@ -99,6 +123,40 @@ struct SelectionGroup: Hashable {
     var isEmpty: Bool {
         strokeIDs.isEmpty && textBoxIDs.isEmpty
     }
+}
+
+struct CanvasPageAnnotations: Hashable, Codable {
+    var strokes: [CanvasStroke]
+    var textBoxes: [CanvasTextBox]
+
+    static let empty = CanvasPageAnnotations(strokes: [], textBoxes: [])
+}
+
+struct CanvasPDFPageInfo: Identifiable, Hashable, Codable {
+    var id: Int { pageIndex }
+    var pageIndex: Int
+    var width: CGFloat
+    var height: CGFloat
+}
+
+struct CanvasPDFPageLayer: Hashable {
+    var sourceFileURL: URL
+    var pageIndex: Int
+    var pageWidth: CGFloat
+    var pageHeight: CGFloat
+    var worldOrigin: CGPoint = .zero
+
+    var worldRect: CGRect {
+        CGRect(x: worldOrigin.x, y: worldOrigin.y, width: pageWidth, height: pageHeight)
+    }
+}
+
+struct PDFNotebook: Identifiable, Hashable {
+    var id: UUID
+    var title: String
+    var sourceFileURL: URL
+    var pages: [CanvasPDFPageInfo]
+    var annotationsByPageIndex: [Int: CanvasPageAnnotations]
 }
 
 enum CanvasBackgroundTemplate: String, CaseIterable, Identifiable {

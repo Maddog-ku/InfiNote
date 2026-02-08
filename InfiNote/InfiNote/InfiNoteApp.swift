@@ -7,9 +7,13 @@ import SwiftUI
 
 @main
 struct InfiNoteApp: App {
+    @StateObject private var settings = AppSettingsStore()
+
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            HomeView()
+                .environmentObject(settings)
+                .environment(\.locale, settings.locale ?? .autoupdatingCurrent)
         }
     }
 }

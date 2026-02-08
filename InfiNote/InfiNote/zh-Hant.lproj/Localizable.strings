@@ -1,0 +1,38 @@
+"home.title" = "InfiNote";
+"home.section.notebooks" = "筆記本";
+"home.back" = "返回";
+"home.action.new_folder" = "新增資料夾";
+"home.action.new_notebook" = "新增筆記本";
+"home.action.import_pdfs" = "匯入 PDF";
+"home.action.settings" = "設定";
+"home.edited_prefix" = "編輯於";
+"home.folder_name" = "資料夾名稱";
+"home.notebook_name" = "筆記本名稱";
+"home.template" = "模板";
+"home.orientation" = "方向";
+"home.pages" = "頁數";
+
+"template.blank" = "空白";
+"template.lined" = "橫線";
+"template.grid" = "方格";
+"template.dotted" = "點陣";
+"orientation.portrait" = "直向";
+"orientation.landscape" = "橫向";
+
+"common.ok" = "確定";
+"common.cancel" = "取消";
+"common.create" = "建立";
+
+"error.title" = "錯誤";
+"error.create_folder_failed" = "建立資料夾失敗：%@";
+"error.create_notebook_failed" = "建立筆記本失敗：%@";
+"error.import_pdf_failed" = "匯入 PDF 失敗：%@";
+
+"settings.title" = "設定";
+"settings.done" = "完成";
+"settings.section.language" = "語言";
+"settings.language.title" = "App 語言";
+"settings.language.footer" = "可選擇跟隨系統語言，或強制使用指定語言。";
+"settings.language.system" = "跟隨系統";
+"settings.language.english" = "英文";
+"settings.language.traditional_chinese" = "繁體中文";

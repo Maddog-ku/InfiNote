@@ -94,14 +94,17 @@ enum BrushRenderer {
         let color = stroke.style.color.uiColor
         let baseWidth = CGFloat(stroke.style.width)
         let baseOpacity = CGFloat(stroke.style.opacity)
-        let viewPoints = stroke.points.map { transform($0.cgPoint) }
+        let lodStride = pointStride(cameraScale: cameraScale, predicted: predicted)
+        let sampledIndices = sampledPointIndices(pointCount: stroke.points.count, stride: lodStride)
+        let sampledPoints = sampledIndices.map { stroke.points[$0] }
+        let viewPoints = sampledPoints.map { transform($0.cgPoint) }
 
         context.saveGState()
         context.setLineCap(.round)
         context.setLineJoin(.round)
         context.setBlendMode(brush.blendMode)
 
-        if stroke.points.count == 1, let only = stroke.points.first {
+        if sampledPoints.count == 1, let only = sampledPoints.first {
             let point = viewPoints[0]
             let width = brush.width(for: only, baseWidth: baseWidth, cameraScale: cameraScale)
             let alpha = brush.alpha(for: only, baseOpacity: baseOpacity, predicted: predicted)
@@ -111,11 +114,18 @@ enum BrushRenderer {
             return
         }
 
-        for index in 1..<stroke.points.count {
-            let prevSample = stroke.points[index - 1]
-            let currentSample = stroke.points[index]
+        let minDistance = minimumSegmentDistance(cameraScale: cameraScale, predicted: predicted)
+        let minDistanceSquared = minDistance * minDistance
+        for index in 1..<sampledPoints.count {
+            let prevSample = sampledPoints[index - 1]
+            let currentSample = sampledPoints[index]
             let start = viewPoints[index - 1]
             let end = viewPoints[index]
+            let dx = end.x - start.x
+            let dy = end.y - start.y
+            if dx * dx + dy * dy < minDistanceSquared, index < sampledPoints.count - 1 {
+                continue
+            }
             let sample = blendedSample(lhs: prevSample, rhs: currentSample)
 
             let width = brush.width(for: sample, baseWidth: baseWidth, cameraScale: cameraScale)
@@ -129,6 +139,43 @@ enum BrushRenderer {
         }
 
         context.restoreGState()
+    }
+
+    private static func pointStride(cameraScale: CGFloat, predicted: Bool) -> Int {
+        guard !predicted else { return 1 }
+        if cameraScale >= 1 { return 1 }
+        if cameraScale >= 0.65 { return 2 }
+        if cameraScale >= 0.4 { return 3 }
+        return 4
+    }
+
+    private static func sampledPointIndices(pointCount: Int, stride: Int) -> [Int] {
+        guard pointCount > 0 else { return [] }
+        guard stride > 1 else { return Array(0..<pointCount) }
+        var indices: [Int] = []
+        indices.reserveCapacity((pointCount / stride) + 2)
+        var index = 0
+        while index < pointCount {
+            indices.append(index)
+            index += stride
+        }
+        if indices.last != pointCount - 1 {
+            indices.append(pointCount - 1)
+        }
+        return indices
+    }
+
+    private static func minimumSegmentDistance(cameraScale: CGFloat, predicted: Bool) -> CGFloat {
+        if predicted {
+            return 1.2
+        }
+        if cameraScale < 0.5 {
+            return 1.5
+        }
+        if cameraScale < 0.8 {
+            return 1.0
+        }
+        return 0.35
     }
 
     private static func blendedSample(lhs: StrokePoint, rhs: StrokePoint) -> StrokePoint {

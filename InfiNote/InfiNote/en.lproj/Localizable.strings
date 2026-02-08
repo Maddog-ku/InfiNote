@@ -1,0 +1,38 @@
+"home.title" = "InfiNote";
+"home.section.notebooks" = "Notebooks";
+"home.back" = "Back";
+"home.action.new_folder" = "New Folder";
+"home.action.new_notebook" = "New Notebook";
+"home.action.import_pdfs" = "Import PDFs";
+"home.action.settings" = "Settings";
+"home.edited_prefix" = "Edited";
+"home.folder_name" = "Folder Name";
+"home.notebook_name" = "Notebook Name";
+"home.template" = "Template";
+"home.orientation" = "Orientation";
+"home.pages" = "Pages";
+
+"template.blank" = "Blank";
+"template.lined" = "Lined";
+"template.grid" = "Grid";
+"template.dotted" = "Dotted";
+"orientation.portrait" = "Portrait";
+"orientation.landscape" = "Landscape";
+
+"common.ok" = "OK";
+"common.cancel" = "Cancel";
+"common.create" = "Create";
+
+"error.title" = "Error";
+"error.create_folder_failed" = "Create folder failed: %@";
+"error.create_notebook_failed" = "Create notebook failed: %@";
+"error.import_pdf_failed" = "Import PDF failed: %@";
+
+"settings.title" = "Settings";
+"settings.done" = "Done";
+"settings.section.language" = "Language";
+"settings.language.title" = "App Language";
+"settings.language.footer" = "Choose a language override or follow system language.";
+"settings.language.system" = "System";
+"settings.language.english" = "English";
+"settings.language.traditional_chinese" = "Traditional Chinese";

@@ -15,6 +15,9 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
 
     private var strokes: [CanvasStroke] = []
     private var textBoxes: [CanvasTextBox] = []
+    private var pdfLayer: CanvasPDFPageLayer?
+    private var cachedPDFDocumentURL: URL?
+    private var cachedPDFDocument: CGPDFDocument?
     private weak var activePencilTouch: UITouch?
     private var activePoints: [CanvasStrokePoint] = []
     private var predictedPoints: [CanvasStrokePoint] = []
@@ -24,8 +27,14 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
     private var eraserSize: CGFloat = 20
     private var eraserEnabled = false
     private var lassoEnabled = false
+    private var textToolEnabled = false
     private var lassoPoints: [CanvasStrokePoint] = []
     private var activeSelection: SelectionGroup?
+    private var selectedTextBoxID: UUID?
+    private var draggingTextBoxID: UUID?
+    private var textDragOffset: CGPoint = .zero
+    private var activeTextStyle: CanvasTextStyle = .default
+    private var activeTextContent: String = "Text"
 
     private let spatialCellSize: CGFloat = 256
     private var strokeBuckets: [SpatialKey: Set<UUID>] = [:]
@@ -35,6 +44,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
 
     private var panGesture: UIPanGestureRecognizer!
     private var pinchGesture: UIPinchGestureRecognizer!
+    private let autosaveStore = CanvasAutosaveStore.shared
 
     private var activeStyle = CanvasStrokeStyle(
         tool: .pen,
@@ -65,7 +75,11 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
     override func layoutSubviews() {
         super.layoutSubviews()
         if !initializedCamera, bounds.width > 0, bounds.height > 0 {
-            camera.translation = CGPoint(x: bounds.midX, y: bounds.midY)
+            if pdfLayer != nil {
+                fitCameraToPDFIfNeeded()
+            } else {
+                camera.translation = CGPoint(x: bounds.midX, y: bounds.midY)
+            }
             initializedCamera = true
         }
     }
@@ -80,13 +94,41 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         activePencilTouch = nil
         lassoPoints.removeAll(keepingCapacity: true)
         activeSelection = nil
+        selectedTextBoxID = nil
+        draggingTextBoxID = nil
         rebuildSpatialIndex()
         setNeedsDisplay()
+        scheduleAutosave()
+    }
+
+    func setPDFLayer(_ layer: CanvasPDFPageLayer?) {
+        pdfLayer = layer
+        fitCameraToPDFIfNeeded()
+        setNeedsDisplay()
+    }
+
+    func setPageAnnotations(_ annotations: CanvasPageAnnotations) {
+        strokes = annotations.strokes
+        textBoxes = annotations.textBoxes
+        activeSelection = nil
+        selectedTextBoxID = nil
+        draggingTextBoxID = nil
+        activePoints.removeAll(keepingCapacity: true)
+        predictedPoints.removeAll(keepingCapacity: true)
+        lassoPoints.removeAll(keepingCapacity: true)
+        rebuildSpatialIndex()
+        setNeedsDisplay()
+        scheduleAutosave()
+    }
+
+    func currentPageAnnotations() -> CanvasPageAnnotations {
+        CanvasPageAnnotations(strokes: strokes, textBoxes: textBoxes)
     }
 
     func setActiveBrush(tool: InkTool, color: UIColor, width: CGFloat, opacity: CGFloat) {
         eraserEnabled = false
         lassoEnabled = false
+        textToolEnabled = false
         activeStyle.tool = tool
         activeStyle.color = StrokeColor(color)
         activeStyle.width = Float(max(0.5, min(40, width)))
@@ -96,6 +138,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
     func setEraser(mode: EraserMode, size: CGFloat) {
         eraserEnabled = true
         lassoEnabled = false
+        textToolEnabled = false
         eraserMode = mode
         eraserSize = max(4, min(80, size))
         predictedPoints.removeAll(keepingCapacity: true)
@@ -109,6 +152,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
     func setLassoEnabled(_ enabled: Bool) {
         lassoEnabled = enabled
         eraserEnabled = false
+        textToolEnabled = false
         predictedPoints.removeAll(keepingCapacity: true)
         activePoints.removeAll(keepingCapacity: true)
         activeEstimatedLookup.removeAll(keepingCapacity: true)
@@ -120,10 +164,68 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         setNeedsDisplay()
     }
 
-    func setTextBoxes(_ boxes: [CanvasTextBox]) {
-        textBoxes = boxes
+    func setTextToolEnabled(_ enabled: Bool) {
+        textToolEnabled = enabled
+        eraserEnabled = false
+        lassoEnabled = false
+        activePoints.removeAll(keepingCapacity: true)
+        predictedPoints.removeAll(keepingCapacity: true)
+        activeEstimatedLookup.removeAll(keepingCapacity: true)
+        activeStrokeStartTimestamp = nil
+        if !enabled {
+            draggingTextBoxID = nil
+        }
+        setNeedsDisplay()
+    }
+
+    func setActiveTextStyle(fontPostScriptName: String, fontSize: CGFloat, color: UIColor) {
+        activeTextStyle.fontPostScriptName = fontPostScriptName
+        activeTextStyle.fontSize = Float(max(8, min(180, fontSize)))
+        activeTextStyle.color = StrokeColor(color)
+        guard let selectedID = selectedTextBoxID,
+              let index = textIndexByID[selectedID] else {
+            return
+        }
+        textBoxes[index].style = activeTextStyle
+        textBoxes[index].updatedAtMillis = nowMillis()
         rebuildSpatialIndex()
         setNeedsDisplay()
+        scheduleAutosave()
+    }
+
+    func setActiveTextContent(_ text: String) {
+        activeTextContent = text.isEmpty ? "Text" : text
+        guard let selectedID = selectedTextBoxID,
+              let index = textIndexByID[selectedID] else {
+            return
+        }
+        textBoxes[index].text = activeTextContent
+        textBoxes[index].updatedAtMillis = nowMillis()
+        setNeedsDisplay()
+    }
+
+    func insertTextBoxAtViewportCenter() {
+        let world = camera.viewToWorld(CGPoint(x: bounds.midX, y: bounds.midY))
+        createTextBox(at: world)
+    }
+
+    func exportVisibleContentPDF() throws -> CanvasPDFExportResult {
+        let contentRect = contentBounds().insetBy(dx: -32, dy: -32)
+        return try CanvasPDFExporter().export(
+            strokes: strokes.filter { !$0.isDeleted },
+            textBoxes: textBoxes,
+            worldRect: contentRect.isNull ? CGRect(x: 0, y: 0, width: 1024, height: 768) : contentRect
+        )
+    }
+
+    func setTextBoxes(_ boxes: [CanvasTextBox]) {
+        textBoxes = boxes
+        if let selectedTextBoxID, !boxes.contains(where: { $0.id == selectedTextBoxID }) {
+            self.selectedTextBoxID = nil
+        }
+        rebuildSpatialIndex()
+        setNeedsDisplay()
+        scheduleAutosave()
     }
 
     func moveSelection(byViewTranslation delta: CGSize) {
@@ -160,6 +262,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         activeSelection = selection
         rebuildSpatialIndex()
         setNeedsDisplay()
+        scheduleAutosave()
     }
 
     func scaleSelection(aroundViewPoint anchor: CGPoint, scale: CGFloat) {
@@ -200,6 +303,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         activeSelection = selection
         rebuildSpatialIndex()
         setNeedsDisplay()
+        scheduleAutosave()
     }
 
     func deleteSelection() {
@@ -209,11 +313,15 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
             strokes.removeAll { deleteIDs.contains($0.id) }
             let deleteTextIDs = selection.textBoxIDs
             textBoxes.removeAll { deleteTextIDs.contains($0.id) }
+            if let selected = selectedTextBoxID, deleteTextIDs.contains(selected) {
+                selectedTextBoxID = nil
+            }
         }
         activeSelection = nil
         lassoPoints.removeAll(keepingCapacity: true)
         rebuildSpatialIndex()
         setNeedsDisplay()
+        scheduleAutosave()
     }
 
     func mergeSelection() {
@@ -263,6 +371,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         )
         rebuildSpatialIndex()
         setNeedsDisplay()
+        scheduleAutosave()
     }
 
     private func configureView() {
@@ -284,6 +393,18 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         pinchGesture = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
         pinchGesture.delegate = self
         addGestureRecognizer(pinchGesture)
+
+        Task { [weak self] in
+            guard let self else { return }
+            guard self.strokes.isEmpty, self.textBoxes.isEmpty else { return }
+            if let restored = await self.autosaveStore.loadLatest(),
+               (!restored.strokes.isEmpty || !restored.textBoxes.isEmpty) {
+                self.strokes = restored.strokes
+                self.textBoxes = restored.textBoxes
+                self.rebuildSpatialIndex()
+                self.setNeedsDisplay()
+            }
+        }
     }
 
     @objc private func handlePan(_ recognizer: UIPanGestureRecognizer) {
@@ -320,7 +441,9 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         }
 
         activePencilTouch = touch
-        if lassoEnabled {
+        if textToolEnabled {
+            handleTextTouchBegan(touch)
+        } else if lassoEnabled {
             lassoPoints.removeAll(keepingCapacity: true)
             activeSelection = nil
             appendLassoPoints(from: event.coalescedTouches(for: touch) ?? [touch])
@@ -345,7 +468,9 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
             return
         }
 
-        if lassoEnabled {
+        if textToolEnabled {
+            handleTextTouchMoved(activeTouch)
+        } else if lassoEnabled {
             appendLassoPoints(from: event.coalescedTouches(for: activeTouch) ?? [activeTouch])
         } else if eraserEnabled {
             applyEraser(for: event.coalescedTouches(for: activeTouch) ?? [activeTouch])
@@ -363,7 +488,9 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         }
 
         if let event {
-            if lassoEnabled {
+            if textToolEnabled {
+                handleTextTouchMoved(activeTouch)
+            } else if lassoEnabled {
                 appendLassoPoints(from: event.coalescedTouches(for: activeTouch) ?? [activeTouch])
             } else if eraserEnabled {
                 applyEraser(for: event.coalescedTouches(for: activeTouch) ?? [activeTouch])
@@ -372,7 +499,9 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
             }
         }
 
-        if lassoEnabled {
+        if textToolEnabled {
+            draggingTextBoxID = nil
+        } else if lassoEnabled {
             commitLassoSelection()
         } else if !eraserEnabled {
             commitActiveStroke()
@@ -393,13 +522,14 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         predictedPoints.removeAll(keepingCapacity: true)
         activeEstimatedLookup.removeAll(keepingCapacity: true)
         lassoPoints.removeAll(keepingCapacity: true)
+        draggingTextBoxID = nil
         activePencilTouch = nil
         activeStrokeStartTimestamp = nil
         setNeedsDisplay()
     }
 
     override func touchesEstimatedPropertiesUpdated(_ touches: Set<UITouch>) {
-        guard !eraserEnabled, !lassoEnabled, activePencilTouch != nil else { return }
+        guard !eraserEnabled, !lassoEnabled, !textToolEnabled, activePencilTouch != nil else { return }
 
         for touch in touches where touch.type == .pencil {
             guard let indexNumber = touch.estimationUpdateIndex,
@@ -421,8 +551,9 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
 
         let visibleWorldRect = worldVisibleRect()
         drawBackground(in: context, visibleWorldRect: visibleWorldRect)
-        drawTextBoxes(in: context, visibleWorldRect: visibleWorldRect)
+        drawPDFLayer(in: context, visibleWorldRect: visibleWorldRect)
         drawCommittedStrokes(in: context, visibleWorldRect: visibleWorldRect)
+        drawTextBoxes(in: context, visibleWorldRect: visibleWorldRect)
         drawActiveStroke(in: context)
         drawLassoOverlay(in: context)
         drawSelectionOverlay(in: context)
@@ -503,6 +634,38 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         context.restoreGState()
     }
 
+    private func drawPDFLayer(in context: CGContext, visibleWorldRect: CGRect) {
+        guard let layer = pdfLayer else { return }
+        let worldRect = layer.worldRect
+        guard worldRect.intersects(visibleWorldRect) else { return }
+        guard let document = pdfDocument(for: layer.sourceFileURL),
+              let page = document.page(at: layer.pageIndex + 1) else {
+            return
+        }
+
+        let topLeft = camera.worldToView(worldRect.origin)
+        let bottomRight = camera.worldToView(CGPoint(x: worldRect.maxX, y: worldRect.maxY))
+        let viewRect = CGRect(
+            x: min(topLeft.x, bottomRight.x),
+            y: min(topLeft.y, bottomRight.y),
+            width: abs(bottomRight.x - topLeft.x),
+            height: abs(bottomRight.y - topLeft.y)
+        )
+        guard viewRect.width > 0.5, viewRect.height > 0.5 else { return }
+
+        context.saveGState()
+        context.interpolationQuality = .high
+        context.setFillColor(UIColor.white.cgColor)
+        context.fill(viewRect)
+        context.translateBy(x: viewRect.minX, y: viewRect.minY)
+        context.scaleBy(x: viewRect.width / layer.pageWidth, y: viewRect.height / layer.pageHeight)
+        // CGPDFPage draws in bottom-left coordinate space.
+        context.translateBy(x: 0, y: layer.pageHeight)
+        context.scaleBy(x: 1, y: -1)
+        context.drawPDFPage(page)
+        context.restoreGState()
+    }
+
     private func adaptiveStep(baseWorldStep: CGFloat) -> CGFloat {
         var step = baseWorldStep
         var screenStep = step * camera.scale
@@ -531,7 +694,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
     private func drawTextBoxes(in context: CGContext, visibleWorldRect: CGRect) {
         let paddedVisibleRect = visibleWorldRect.insetBy(dx: -20 / camera.scale, dy: -20 / camera.scale)
         context.saveGState()
-        for box in textBoxes where box.frame.cgRect.intersects(paddedVisibleRect) {
+        for box in textBoxes.sorted(by: { $0.zIndex < $1.zIndex }) where box.frame.cgRect.intersects(paddedVisibleRect) {
             let rect = box.frame.cgRect
             let topLeft = camera.worldToView(rect.origin)
             let bottomRight = camera.worldToView(CGPoint(x: rect.maxX, y: rect.maxY))
@@ -541,13 +704,23 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
                 width: abs(bottomRight.x - topLeft.x),
                 height: abs(bottomRight.y - topLeft.y)
             )
-            context.setStrokeColor(UIColor.systemGray3.cgColor)
-            context.setLineWidth(1)
+            let isSelected = box.id == selectedTextBoxID
+            context.setStrokeColor((isSelected ? UIColor.systemBlue : UIColor.systemGray3).cgColor)
+            context.setLineWidth(isSelected ? 1.8 : 1)
+            if isSelected {
+                context.setLineDash(phase: 0, lengths: [6, 4])
+            } else {
+                context.setLineDash(phase: 0, lengths: [])
+            }
             context.stroke(viewRect)
 
+            let baseFont = FontRegistry.shared.uiFont(
+                postScriptName: box.style.fontPostScriptName,
+                size: CGFloat(box.style.fontSize)
+            ) ?? UIFont.systemFont(ofSize: CGFloat(box.style.fontSize))
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 13),
-                .foregroundColor: UIColor.label
+                .font: baseFont,
+                .foregroundColor: box.style.color.uiColor
             ]
             (box.text as NSString).draw(in: viewRect.insetBy(dx: 6, dy: 4), withAttributes: attrs)
         }
@@ -555,7 +728,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func drawActiveStroke(in context: CGContext) {
-        guard !eraserEnabled else { return }
+        guard !eraserEnabled, !textToolEnabled else { return }
         guard !activePoints.isEmpty else { return }
 
         let activeStroke = CanvasStroke(
@@ -701,6 +874,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         }
         if changed {
             rebuildSpatialIndex()
+            scheduleAutosave()
         }
     }
 
@@ -721,6 +895,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
 
         strokes = rebuilt
         rebuildSpatialIndex()
+        scheduleAutosave()
     }
 
     private func splitStrokeByCircle(_ stroke: CanvasStroke, center: CGPoint, radius: CGFloat) -> [CanvasStroke] {
@@ -1080,6 +1255,111 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         return result
     }
 
+    private func pdfDocument(for url: URL) -> CGPDFDocument? {
+        if cachedPDFDocumentURL == url, let cachedPDFDocument {
+            return cachedPDFDocument
+        }
+        let document = CGPDFDocument(url as CFURL)
+        cachedPDFDocumentURL = url
+        cachedPDFDocument = document
+        return document
+    }
+
+    private func fitCameraToPDFIfNeeded() {
+        guard let layer = pdfLayer, bounds.width > 0, bounds.height > 0 else { return }
+        let margin: CGFloat = 24
+        let availableWidth = max(1, bounds.width - margin * 2)
+        let availableHeight = max(1, bounds.height - margin * 2)
+        let fittedScale = min(availableWidth / layer.pageWidth, availableHeight / layer.pageHeight)
+        camera.scale = max(camera.minScale, min(camera.maxScale, fittedScale))
+        camera.translation = CGPoint(
+            x: bounds.midX - layer.worldRect.midX * camera.scale,
+            y: bounds.midY - layer.worldRect.midY * camera.scale
+        )
+    }
+
+    private func handleTextTouchBegan(_ touch: UITouch) {
+        let worldPoint = camera.viewToWorld(touch.location(in: self))
+        if let hitID = textBoxID(at: worldPoint), let index = textIndexByID[hitID] {
+            selectedTextBoxID = hitID
+            draggingTextBoxID = hitID
+            let frame = textBoxes[index].frame.cgRect
+            textDragOffset = CGPoint(x: worldPoint.x - frame.minX, y: worldPoint.y - frame.minY)
+        } else {
+            createTextBox(at: worldPoint)
+        }
+        setNeedsDisplay()
+    }
+
+    private func handleTextTouchMoved(_ touch: UITouch) {
+        guard let draggingID = draggingTextBoxID,
+              let index = textIndexByID[draggingID] else { return }
+        let worldPoint = camera.viewToWorld(touch.location(in: self))
+        let frame = textBoxes[index].frame.cgRect
+        let newMinX = worldPoint.x - textDragOffset.x
+        let newMinY = worldPoint.y - textDragOffset.y
+        textBoxes[index].frame = StrokeBounds(
+            minX: Float(newMinX),
+            minY: Float(newMinY),
+            maxX: Float(newMinX + frame.width),
+            maxY: Float(newMinY + frame.height)
+        )
+        textBoxes[index].updatedAtMillis = nowMillis()
+        rebuildSpatialIndex()
+        setNeedsDisplay()
+    }
+
+    private func createTextBox(at worldPoint: CGPoint) {
+        let now = nowMillis()
+        let fontSize = CGFloat(activeTextStyle.fontSize)
+        let width = max(140, min(520, CGFloat(activeTextContent.count) * fontSize * 0.6 + 20))
+        let height = max(44, fontSize * CGFloat(activeTextStyle.lineHeightMultiple) + 20)
+        let minX = worldPoint.x - width * 0.5
+        let minY = worldPoint.y - height * 0.5
+        let newBox = CanvasTextBox(
+            id: UUID(),
+            text: activeTextContent,
+            frame: StrokeBounds(
+                minX: Float(minX),
+                minY: Float(minY),
+                maxX: Float(minX + width),
+                maxY: Float(minY + height)
+            ),
+            rotation: 0,
+            style: activeTextStyle,
+            zIndex: (textBoxes.map(\.zIndex).max() ?? 0) + 1,
+            isLocked: false,
+            createdAtMillis: now,
+            updatedAtMillis: now
+        )
+        textBoxes.append(newBox)
+        selectedTextBoxID = newBox.id
+        draggingTextBoxID = newBox.id
+        textDragOffset = CGPoint(x: width * 0.5, y: height * 0.5)
+        rebuildSpatialIndex()
+        scheduleAutosave()
+    }
+
+    private func textBoxID(at worldPoint: CGPoint) -> UUID? {
+        let sampleRect = CGRect(x: worldPoint.x - 1, y: worldPoint.y - 1, width: 2, height: 2)
+        let candidates = queryIDs(in: sampleRect, from: textBuckets)
+        let ordered = textBoxes
+            .filter { candidates.contains($0.id) && !$0.isLocked }
+            .sorted { $0.zIndex > $1.zIndex }
+        return ordered.first(where: { $0.frame.cgRect.contains(worldPoint) })?.id
+    }
+
+    private func contentBounds() -> CGRect {
+        var rect: CGRect?
+        for stroke in strokes where !stroke.isDeleted {
+            rect = rect?.union(stroke.bounds.cgRect) ?? stroke.bounds.cgRect
+        }
+        for box in textBoxes {
+            rect = rect?.union(box.frame.cgRect) ?? box.frame.cgRect
+        }
+        return rect ?? .null
+    }
+
     private func commitActiveStroke() {
         guard activePoints.count >= 2 else {
             activePoints.removeAll(keepingCapacity: true)
@@ -1104,6 +1384,7 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         activePoints.removeAll(keepingCapacity: true)
         activeEstimatedLookup.removeAll(keepingCapacity: true)
         rebuildSpatialIndex()
+        scheduleAutosave()
     }
 
     private func boundsFor(points: [CanvasStrokePoint]) -> StrokeBounds {
@@ -1112,6 +1393,13 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
 
     private func nowMillis() -> Int64 {
         Int64(Date().timeIntervalSince1970 * 1000)
+    }
+
+    private func scheduleAutosave() {
+        let annotations = CanvasPageAnnotations(strokes: strokes, textBoxes: textBoxes)
+        Task { [annotations] in
+            await autosaveStore.scheduleSave(annotations: annotations)
+        }
     }
 
 }
