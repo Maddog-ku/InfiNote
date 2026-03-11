@@ -160,6 +160,7 @@ struct PDFNotebook: Identifiable, Hashable {
 }
 
 enum CanvasBackgroundTemplate: String, CaseIterable, Identifiable {
+    case blank
     case lines
     case grid
     case dots
@@ -168,6 +169,8 @@ enum CanvasBackgroundTemplate: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
+        case .blank:
+            return "Blank"
         case .lines:
             return "Lines"
         case .grid:

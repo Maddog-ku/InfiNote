@@ -26,7 +26,9 @@ struct PDFImportService {
             }
 
             guard sourceURL.pathExtension.lowercased() == "pdf" else { continue }
-            let targetURL = notebooksFolder.appendingPathComponent(sourceURL.lastPathComponent)
+            let ext = sourceURL.pathExtension.isEmpty ? "pdf" : sourceURL.pathExtension
+            let targetName = "\(UUID().uuidString).\(ext)"
+            let targetURL = notebooksFolder.appendingPathComponent(targetName)
             if FileManager.default.fileExists(atPath: targetURL.path) {
                 try? FileManager.default.removeItem(at: targetURL)
             }
@@ -63,6 +65,10 @@ struct PDFImportService {
             imported.append(notebook)
         }
         return imported
+    }
+
+    func localNotebooksDirectory() throws -> URL {
+        try notebooksDirectory()
     }
 
     private func notebooksDirectory() throws -> URL {

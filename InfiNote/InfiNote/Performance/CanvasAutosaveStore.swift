@@ -31,25 +31,33 @@ actor CanvasAutosaveStore {
         }
     }
 
-    func loadLatest() -> CanvasPageAnnotations? {
+    func loadLatest() async -> CanvasPageAnnotations? {
         guard let url = try? autosaveURL(),
               fileManager.fileExists(atPath: url.path),
               let data = try? Data(contentsOf: url),
-              let blob = try? JSONDecoder().decode(AutosaveBlob.self, from: data),
-              let strokeDoc = try? StrokeCodec.decodeBinary(blob.strokesBinary) else {
+              let blob = try? JSONDecoder().decode(AutosaveBlob.self, from: data) else {
             return nil
         }
+        let strokeDoc = await MainActor.run {
+            try? StrokeCodec.decodeBinary(blob.strokesBinary)
+        }
+        guard let strokeDoc else { return nil }
         return CanvasPageAnnotations(strokes: strokeDoc.strokes, textBoxes: blob.textBoxes)
     }
 
     private func persist(annotations: CanvasPageAnnotations) async throws {
-        let strokesDocument = StrokeDocument(
-            formatVersion: StrokeDocument.currentVersion,
-            strokes: annotations.strokes
-        )
+        let strokesDocument = await MainActor.run {
+            StrokeDocument(
+                formatVersion: StrokeDocument.currentVersion,
+                strokes: annotations.strokes
+            )
+        }
+        let strokesBinary = await MainActor.run {
+            StrokeCodec.encodeBinary(strokesDocument)
+        }
         let blob = AutosaveBlob(
             version: 1,
-            strokesBinary: StrokeCodec.encodeBinary(strokesDocument),
+            strokesBinary: strokesBinary,
             textBoxes: annotations.textBoxes,
             savedAtMillis: Int64(Date().timeIntervalSince1970 * 1000)
         )
@@ -71,4 +79,3 @@ actor CanvasAutosaveStore {
         return directory.appendingPathComponent("latest_page.json")
     }
 }
-

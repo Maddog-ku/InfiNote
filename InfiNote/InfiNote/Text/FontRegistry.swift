@@ -15,6 +15,7 @@ struct ImportedFont: Hashable {
 enum FontRegistryError: Error {
     case appSupportUnavailable
     case importFailed(URL)
+    case deleteFailed(URL)
 }
 
 final class FontRegistry {
@@ -78,6 +79,33 @@ final class FontRegistry {
         UIFont.familyNames
             .flatMap { UIFont.fontNames(forFamilyName: $0) }
             .sorted()
+    }
+
+    func persistedFontFileURLs() throws -> [URL] {
+        let folder = try fontsDirectory()
+        guard fileManager.fileExists(atPath: folder.path) else { return [] }
+        return try fileManager
+            .contentsOfDirectory(at: folder, includingPropertiesForKeys: nil)
+            .filter { ["ttf", "otf"].contains($0.pathExtension.lowercased()) }
+            .sorted(by: { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending })
+    }
+
+    @discardableResult
+    func deletePersistedFontFiles(urls: [URL]) throws -> [URL] {
+        var deleted: [URL] = []
+        for url in urls {
+            var unregisterError: Unmanaged<CFError>?
+            CTFontManagerUnregisterFontsForURL(url as CFURL, .process, &unregisterError)
+            do {
+                if fileManager.fileExists(atPath: url.path) {
+                    try fileManager.removeItem(at: url)
+                    deleted.append(url)
+                }
+            } catch {
+                throw FontRegistryError.deleteFailed(url)
+            }
+        }
+        return deleted
     }
 
     func uiFont(postScriptName: String, size: CGFloat) -> UIFont? {

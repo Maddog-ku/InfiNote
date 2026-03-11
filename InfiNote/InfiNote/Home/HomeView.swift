@@ -1,10 +1,9 @@
-//
-//  HomeView.swift
-//  InfiNote
-//
-
 import SwiftUI
 import UniformTypeIdentifiers
+
+private enum HomeRoute: Hashable {
+    case notebook(UUID)
+}
 
 struct HomeView: View {
     @EnvironmentObject private var settings: AppSettingsStore
@@ -16,6 +15,9 @@ struct HomeView: View {
     @State private var showPDFImporter = false
     @State private var showSettings = false
     @State private var errorMessage = ""
+
+    @State private var pendingDelete: PendingDeleteAction?
+    @State private var pendingRename: PendingRenameAction?
 
     var body: some View {
         NavigationStack {
@@ -32,44 +34,83 @@ struct HomeView: View {
                         Button {
                             store.enterFolder(folder.id)
                         } label: {
-                            HStack(spacing: 10) {
-                                Image(systemName: "folder.fill")
-                                    .font(.title3)
-                                    .foregroundStyle(.orange)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(folder.name)
-                                        .font(.headline)
-                                        .foregroundStyle(.primary)
-                                    Text(formattedDate(folder.updatedAtMillis))
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                                Image(systemName: "chevron.right")
-                                    .foregroundStyle(.tertiary)
-                            }
-                            .padding(12)
-                            .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+                            FolderRow(folder: folder, formattedDate: formattedDate(folder.updatedAtMillis))
                         }
                         .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                pendingRename = .folder(folder)
+                            } label: {
+                                Label("Rename", systemImage: "pencil")
+                            }
+
+                            Button(role: .destructive) {
+                                pendingDelete = .folder(folder)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
+                        }
                     }
 
-                    if !store.notebooks(in: store.currentFolderID).isEmpty {
+                    let notebooks = store.notebooks(in: store.currentFolderID)
+                    if !notebooks.isEmpty {
                         Text("home.section.notebooks")
                             .font(.headline)
                             .padding(.top, 6)
                     }
+
                     LazyVGrid(columns: [GridItem(.adaptive(minimum: 170), spacing: 12)], spacing: 12) {
-                        ForEach(store.notebooks(in: store.currentFolderID)) { notebook in
-                            NavigationLink {
-                                NotebookPlaceholderDetailView(notebook: notebook)
-                            } label: {
+                        ForEach(notebooks) { notebook in
+                            NavigationLink(value: HomeRoute.notebook(notebook.id)) {
                                 NotebookCardView(notebook: notebook, thumbnails: thumbnails)
                             }
                             .simultaneousGesture(TapGesture().onEnded {
                                 try? store.touchNotebook(notebook.id)
                             })
                             .buttonStyle(.plain)
+                            .contextMenu {
+                                Button {
+                                    pendingRename = .notebook(notebook)
+                                } label: {
+                                    Label("Rename", systemImage: "pencil")
+                                }
+
+                                Button(role: .destructive) {
+                                    pendingDelete = .notebook(notebook)
+                                } label: {
+                                    Label("Delete", systemImage: "trash")
+                                }
+                            }
+                        }
+                    }
+
+                    let resources = store.resources
+                        .filter { !$0.isDeleted }
+                        .sorted { $0.originalFileName.localizedStandardCompare($1.originalFileName) == .orderedAscending }
+
+                    if !resources.isEmpty {
+                        Text("Imported Files")
+                            .font(.headline)
+                            .padding(.top, 6)
+                    }
+
+                    ForEach(resources) { resource in
+                        ImportedFileRow(
+                            resource: resource,
+                            referenceCount: store.referenceCount(for: resource.id)
+                        )
+                        .contextMenu {
+                            Button {
+                                pendingRename = .resource(resource)
+                            } label: {
+                                Label("Rename", systemImage: "pencil")
+                            }
+
+                            Button(role: .destructive) {
+                                pendingDelete = .resource(resource)
+                            } label: {
+                                Label("Delete", systemImage: "trash")
+                            }
                         }
                     }
                 }
@@ -77,6 +118,12 @@ struct HomeView: View {
             }
             .background(Color(uiColor: .systemGroupedBackground))
             .navigationTitle("home.title")
+            .navigationDestination(for: HomeRoute.self) { route in
+                switch route {
+                case let .notebook(notebookID):
+                    NotebookDetailView(notebookID: notebookID, store: store)
+                }
+            }
             .toolbar {
                 ToolbarItem(placement: .topBarLeading) {
                     if store.currentFolderID != nil {
@@ -136,6 +183,19 @@ struct HomeView: View {
                 }
             }
         }
+        .sheet(item: $pendingRename) { action in
+            RenameItemSheet(
+                title: action.title,
+                initialName: action.currentName
+            ) { newName in
+                do {
+                    try applyRename(action: action, newName: newName)
+                    pendingRename = nil
+                } catch {
+                    errorMessage = humanReadable(error)
+                }
+            }
+        }
         .sheet(isPresented: $showSettings) {
             SettingsView()
                 .environmentObject(settings)
@@ -162,6 +222,28 @@ struct HomeView: View {
                 )
             }
         }
+        .confirmationDialog(
+            pendingDelete?.title ?? "Delete",
+            isPresented: Binding(
+                get: { pendingDelete != nil },
+                set: { if !$0 { pendingDelete = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                do {
+                    try performDelete()
+                    pendingDelete = nil
+                } catch {
+                    errorMessage = humanReadable(error)
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                pendingDelete = nil
+            }
+        } message: {
+            Text(pendingDelete?.message ?? "")
+        }
         .alert("error.title", isPresented: Binding(
             get: { !errorMessage.isEmpty },
             set: { if !$0 { errorMessage = "" } }
@@ -172,6 +254,51 @@ struct HomeView: View {
         }
     }
 
+    private func applyRename(action: PendingRenameAction, newName: String) throws {
+        switch action {
+        case let .folder(folder):
+            try store.renameFolder(folder.id, to: newName)
+        case let .notebook(notebook):
+            try store.renameNotebook(notebook.id, to: newName)
+        case let .resource(resource):
+            if resource.kind == .pdf {
+                try store.renamePDF(resource.id, to: newName)
+            } else {
+                try store.renameFile(resource.id, to: newName)
+            }
+        }
+    }
+
+    private func performDelete() throws {
+        guard let pendingDelete else { return }
+        switch pendingDelete {
+        case let .folder(folder):
+            _ = try store.deleteFolder(folder.id, policy: .deleteIfNoReferences)
+        case let .notebook(notebook):
+            _ = try store.deleteNotebook(notebook.id, policy: .deleteIfNoReferences)
+        case let .resource(resource):
+            if resource.kind == .pdf {
+                _ = try store.deletePDF(resource.id, policy: .deleteIfNoReferences)
+            } else {
+                _ = try store.deleteFile(resource.id, policy: .deleteIfNoReferences)
+            }
+        }
+    }
+
+    private func humanReadable(_ error: Error) -> String {
+        if let libraryError = error as? HomeLibraryError {
+            switch libraryError {
+            case .invalidName:
+                return "Name is empty or contains invalid characters: / \\ : * ? \" < > |"
+            case .resourceInUse:
+                return "This file is still referenced by one or more notes."
+            default:
+                return String(describing: libraryError)
+            }
+        }
+        return error.localizedDescription
+    }
+
     private func formattedDate(_ millis: Int64) -> String {
         let date = Date(timeIntervalSince1970: Double(millis) / 1000.0)
         let formatter = DateFormatter()
@@ -179,6 +306,131 @@ struct HomeView: View {
         formatter.timeStyle = .short
         let prefix = NSLocalizedString("home.edited_prefix", comment: "")
         return "\(prefix) \(formatter.string(from: date))"
+    }
+}
+
+private enum PendingDeleteAction: Identifiable {
+    case folder(NoteFolder)
+    case notebook(NotebookRecord)
+    case resource(ImportedResource)
+
+    var id: String {
+        switch self {
+        case let .folder(folder): return "folder-\(folder.id.uuidString)"
+        case let .notebook(notebook): return "notebook-\(notebook.id.uuidString)"
+        case let .resource(resource): return "resource-\(resource.id.uuidString)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .folder: return "Delete Folder"
+        case .notebook: return "Delete Notebook"
+        case let .resource(resource):
+            return resource.kind == .pdf ? "Delete PDF" : "Delete File"
+        }
+    }
+
+    var message: String {
+        switch self {
+        case let .folder(folder):
+            return "Delete folder \"\(folder.name)\" and all nested notebooks?"
+        case let .notebook(notebook):
+            return "Delete notebook \"\(notebook.title)\"?"
+        case let .resource(resource):
+            return "Delete file \"\(resource.originalFileName)\"?"
+        }
+    }
+}
+
+private enum PendingRenameAction: Identifiable {
+    case folder(NoteFolder)
+    case notebook(NotebookRecord)
+    case resource(ImportedResource)
+
+    var id: String {
+        switch self {
+        case let .folder(folder): return "folder-\(folder.id.uuidString)"
+        case let .notebook(notebook): return "notebook-\(notebook.id.uuidString)"
+        case let .resource(resource): return "resource-\(resource.id.uuidString)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .folder: return "Rename Folder"
+        case .notebook: return "Rename Notebook"
+        case let .resource(resource):
+            return resource.kind == .pdf ? "Rename PDF" : "Rename File"
+        }
+    }
+
+    var currentName: String {
+        switch self {
+        case let .folder(folder): return folder.name
+        case let .notebook(notebook): return notebook.title
+        case let .resource(resource): return resource.originalFileName
+        }
+    }
+}
+
+private struct FolderRow: View {
+    let folder: NoteFolder
+    let formattedDate: String
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "folder.fill")
+                .font(.title3)
+                .foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(folder.name)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                Text(formattedDate)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+            Image(systemName: "chevron.right")
+                .foregroundStyle(.tertiary)
+        }
+        .padding(12)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+}
+
+private struct ImportedFileRow: View {
+    let resource: ImportedResource
+    let referenceCount: Int
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Image(systemName: iconName)
+                .font(.title3)
+                .foregroundStyle(.blue)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(resource.originalFileName)
+                    .font(.subheadline.weight(.semibold))
+                    .lineLimit(1)
+                Text("\(resource.kind.rawValue.uppercased()) · refs \(referenceCount)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        .padding(10)
+        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var iconName: String {
+        switch resource.kind {
+        case .pdf: return "doc.richtext"
+        case .image: return "photo"
+        case .font: return "textformat"
+        case .file: return "doc"
+        case .page, .canvas: return "square.stack"
+        }
     }
 }
 
@@ -255,6 +507,38 @@ private struct BreadcrumbView: View {
     }
 }
 
+private struct RenameItemSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let title: String
+    let initialName: String
+    var onSave: (String) -> Void
+
+    @State private var name: String = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                TextField("Name", text: $name)
+            }
+            .navigationTitle(title)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        onSave(name)
+                        dismiss()
+                    }
+                }
+            }
+            .onAppear {
+                name = initialName
+            }
+        }
+    }
+}
+
 private struct CreateFolderSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var name = ""
@@ -312,36 +596,5 @@ private struct CreateNotebookSheet: View {
                 }
             }
         }
-    }
-}
-
-private struct NotebookPlaceholderDetailView: View {
-    let notebook: NotebookRecord
-
-    var body: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "book.pages")
-                .font(.system(size: 36))
-                .foregroundStyle(Color.accentColor)
-            Text(notebook.title)
-                .font(.title3.weight(.semibold))
-            HStack {
-                Text("home.template")
-                Spacer()
-                Text(notebook.template.titleKey)
-            }
-            HStack {
-                Text("home.orientation")
-                Spacer()
-                Text(notebook.orientation.titleKey)
-            }
-            HStack {
-                Text("home.pages")
-                Spacer()
-                Text("\(notebook.pageCount)")
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color(uiColor: .systemGroupedBackground))
     }
 }

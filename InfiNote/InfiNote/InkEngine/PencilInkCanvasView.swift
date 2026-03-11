@@ -53,6 +53,56 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         opacity: 1
     )
 
+    private struct BackgroundTemplateStyle {
+        let strokeColor: UIColor
+        let dotColor: UIColor
+        let minorStep: CGFloat
+        let majorEvery: Int
+        let minorAlpha: CGFloat
+        let majorAlpha: CGFloat
+        let dotRadius: CGFloat
+
+        static let blank = BackgroundTemplateStyle(
+            strokeColor: .clear,
+            dotColor: .clear,
+            minorStep: 32,
+            majorEvery: 4,
+            minorAlpha: 0,
+            majorAlpha: 0,
+            dotRadius: 0
+        )
+
+        static let lined = BackgroundTemplateStyle(
+            strokeColor: UIColor.systemGray4,
+            dotColor: .clear,
+            minorStep: 32,
+            majorEvery: 4,
+            minorAlpha: 0.55,
+            majorAlpha: 0.55,
+            dotRadius: 0
+        )
+
+        static let grid = BackgroundTemplateStyle(
+            strokeColor: UIColor.systemGray4,
+            dotColor: .clear,
+            minorStep: 32,
+            majorEvery: 4,
+            minorAlpha: 0.35,
+            majorAlpha: 0.6,
+            dotRadius: 0
+        )
+
+        static let dots = BackgroundTemplateStyle(
+            strokeColor: .clear,
+            dotColor: UIColor.systemGray3,
+            minorStep: 28,
+            majorEvery: 4,
+            minorAlpha: 0,
+            majorAlpha: 0,
+            dotRadius: 1.15
+        )
+    }
+
     private struct SpatialKey: Hashable {
         var x: Int
         var y: Int
@@ -103,7 +153,12 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
 
     func setPDFLayer(_ layer: CanvasPDFPageLayer?) {
         pdfLayer = layer
-        fitCameraToPDFIfNeeded()
+        if layer != nil {
+            fitCameraToPDFIfNeeded()
+        } else if bounds.width > 0, bounds.height > 0 {
+            camera.scale = 1
+            camera.translation = CGPoint(x: bounds.midX, y: bounds.midY)
+        }
         setNeedsDisplay()
     }
 
@@ -394,17 +449,6 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
         pinchGesture.delegate = self
         addGestureRecognizer(pinchGesture)
 
-        Task { [weak self] in
-            guard let self else { return }
-            guard self.strokes.isEmpty, self.textBoxes.isEmpty else { return }
-            if let restored = await self.autosaveStore.loadLatest(),
-               (!restored.strokes.isEmpty || !restored.textBoxes.isEmpty) {
-                self.strokes = restored.strokes
-                self.textBoxes = restored.textBoxes
-                self.rebuildSpatialIndex()
-                self.setNeedsDisplay()
-            }
-        }
     }
 
     @objc private func handlePan(_ recognizer: UIPanGestureRecognizer) {
@@ -571,67 +615,106 @@ final class PencilInkCanvasView: UIView, UIGestureRecognizerDelegate {
     }
 
     private func drawBackground(in context: CGContext, visibleWorldRect: CGRect) {
-        let baseStep: CGFloat = 32
-        let step = adaptiveStep(baseWorldStep: baseStep)
-        let minX = floor(visibleWorldRect.minX / step) * step
-        let maxX = ceil(visibleWorldRect.maxX / step) * step
-        let minY = floor(visibleWorldRect.minY / step) * step
-        let maxY = ceil(visibleWorldRect.maxY / step) * step
+        let style = backgroundTemplateStyle()
+        guard backgroundTemplate != .blank else { return }
+
+        let step = adaptiveStep(baseWorldStep: style.minorStep)
+        let minXIndex = Int(floor(visibleWorldRect.minX / step))
+        let maxXIndex = Int(ceil(visibleWorldRect.maxX / step))
+        let minYIndex = Int(floor(visibleWorldRect.minY / step))
+        let maxYIndex = Int(ceil(visibleWorldRect.maxY / step))
+        let screenStep = step * camera.scale
+        guard screenStep > 0 else { return }
+        let pixel = 1 / max(1, contentScaleFactor)
 
         context.saveGState()
-        context.setLineWidth(1)
+        context.setAllowsAntialiasing(false)
+        context.clip(to: bounds)
 
         switch backgroundTemplate {
+        case .blank:
+            break
+
         case .lines:
-            context.setStrokeColor(UIColor.systemGray5.cgColor)
-            var y = minY
-            while y <= maxY {
-                let from = camera.worldToView(CGPoint(x: minX, y: y))
-                let to = camera.worldToView(CGPoint(x: maxX, y: y))
-                context.move(to: from)
-                context.addLine(to: to)
-                y += step
+            context.setLineWidth(pixel)
+            for yIndex in minYIndex...maxYIndex {
+                let y = CGFloat(yIndex) * step
+                let isMajor = yIndex.isMultiple(of: style.majorEvery)
+                let alpha = isMajor ? style.majorAlpha : style.minorAlpha
+                let yView = alignedPixel(camera.worldToView(CGPoint(x: 0, y: y)).y, pixel: pixel)
+                context.setStrokeColor(style.strokeColor.withAlphaComponent(alpha).cgColor)
+                context.move(to: CGPoint(x: bounds.minX, y: yView))
+                context.addLine(to: CGPoint(x: bounds.maxX, y: yView))
+                context.strokePath()
             }
-            context.strokePath()
 
         case .grid:
-            context.setStrokeColor(UIColor.systemGray5.cgColor)
-            var x = minX
-            while x <= maxX {
-                let from = camera.worldToView(CGPoint(x: x, y: minY))
-                let to = camera.worldToView(CGPoint(x: x, y: maxY))
-                context.move(to: from)
-                context.addLine(to: to)
-                x += step
+            context.setLineWidth(pixel)
+            for xIndex in minXIndex...maxXIndex {
+                let x = CGFloat(xIndex) * step
+                let isMajor = xIndex.isMultiple(of: style.majorEvery)
+                let alpha = isMajor ? style.majorAlpha : style.minorAlpha
+                let xView = alignedPixel(camera.worldToView(CGPoint(x: x, y: 0)).x, pixel: pixel)
+                context.setStrokeColor(style.strokeColor.withAlphaComponent(alpha).cgColor)
+                context.move(to: CGPoint(x: xView, y: bounds.minY))
+                context.addLine(to: CGPoint(x: xView, y: bounds.maxY))
+                context.strokePath()
             }
 
-            var y = minY
-            while y <= maxY {
-                let from = camera.worldToView(CGPoint(x: minX, y: y))
-                let to = camera.worldToView(CGPoint(x: maxX, y: y))
-                context.move(to: from)
-                context.addLine(to: to)
-                y += step
+            for yIndex in minYIndex...maxYIndex {
+                let y = CGFloat(yIndex) * step
+                let isMajor = yIndex.isMultiple(of: style.majorEvery)
+                let alpha = isMajor ? style.majorAlpha : style.minorAlpha
+                let yView = alignedPixel(camera.worldToView(CGPoint(x: 0, y: y)).y, pixel: pixel)
+                context.setStrokeColor(style.strokeColor.withAlphaComponent(alpha).cgColor)
+                context.move(to: CGPoint(x: bounds.minX, y: yView))
+                context.addLine(to: CGPoint(x: bounds.maxX, y: yView))
+                context.strokePath()
             }
-            context.strokePath()
 
         case .dots:
-            context.setFillColor(UIColor.systemGray4.cgColor)
-            let radius: CGFloat = 1.2
-
-            var x = minX
-            while x <= maxX {
-                var y = minY
-                while y <= maxY {
-                    let p = camera.worldToView(CGPoint(x: x, y: y))
-                    context.fillEllipse(in: CGRect(x: p.x - radius, y: p.y - radius, width: radius * 2, height: radius * 2))
-                    y += step
+            let radius = max(pixel * 0.75, style.dotRadius)
+            context.setFillColor(style.dotColor.cgColor)
+            for xIndex in minXIndex...maxXIndex {
+                let x = CGFloat(xIndex) * step
+                let xView = camera.worldToView(CGPoint(x: x, y: 0)).x
+                for yIndex in minYIndex...maxYIndex {
+                    let y = CGFloat(yIndex) * step
+                    let yView = camera.worldToView(CGPoint(x: 0, y: y)).y
+                    let point = CGPoint(
+                        x: alignedPixel(xView, pixel: pixel),
+                        y: alignedPixel(yView, pixel: pixel)
+                    )
+                    context.fillEllipse(
+                        in: CGRect(
+                            x: point.x - radius,
+                            y: point.y - radius,
+                            width: radius * 2,
+                            height: radius * 2
+                        )
+                    )
                 }
-                x += step
             }
         }
 
         context.restoreGState()
+    }
+
+    private func backgroundTemplateStyle() -> BackgroundTemplateStyle {
+        switch backgroundTemplate {
+        case .blank:
+            return .blank
+        case .lines:
+            return .lined
+        case .grid:
+            return .grid
+        case .dots:
+            return .dots
+        }
+    }
+
+    private func alignedPixel(_ value: CGFloat, pixel: CGFloat) -> CGFloat {
+        (round(value / pixel) * pixel) + pixel * 0.5
     }
 
     private func drawPDFLayer(in context: CGContext, visibleWorldRect: CGRect) {

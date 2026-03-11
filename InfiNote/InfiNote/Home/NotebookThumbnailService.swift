@@ -13,6 +13,7 @@ final class NotebookThumbnailService {
 
     private let fileManager = FileManager.default
     private let memoryCache = NSCache<NSString, UIImage>()
+    private var memoryKeys: Set<String> = []
 
     private init() {
         memoryCache.countLimit = 200
@@ -27,18 +28,47 @@ final class NotebookThumbnailService {
             return cached
         }
         if let disk = loadFromDisk(cacheKey: key) {
-            memoryCache.setObject(disk, forKey: key as NSString, cost: estimatedCost(of: disk))
+            setMemoryCache(image: disk, key: key)
             return disk
         }
 
         let image = renderThumbnail(for: notebook, size: normalizedSize, scale: scale)
-        memoryCache.setObject(image, forKey: key as NSString, cost: estimatedCost(of: image))
+        setMemoryCache(image: image, key: key)
         saveToDisk(image: image, cacheKey: key)
         return image
     }
 
+    func removeThumbnails(for notebookID: UUID) {
+        let prefix = notebookID.uuidString + "-"
+        let keysToRemove = memoryKeys.filter { $0.hasPrefix(prefix) }
+        for key in keysToRemove {
+            memoryCache.removeObject(forKey: key as NSString)
+            memoryKeys.remove(key)
+        }
+
+        guard let folder = try? cacheDirectory(),
+              let urls = try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
+            return
+        }
+        for url in urls where url.lastPathComponent.hasPrefix(prefix) {
+            try? fileManager.removeItem(at: url)
+        }
+    }
+
+    func removeAllCachedThumbnails() {
+        memoryCache.removeAllObjects()
+        memoryKeys.removeAll()
+        guard let folder = try? cacheDirectory(),
+              let urls = try? fileManager.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) else {
+            return
+        }
+        for url in urls {
+            try? fileManager.removeItem(at: url)
+        }
+    }
+
     private func renderThumbnail(for notebook: NotebookRecord, size: CGSize, scale: CGFloat) -> UIImage {
-        if let pdfURL = localPDFURL(fileName: notebook.sourcePDFFileName),
+        if let pdfURL = localPDFURL(relativePath: notebook.sourcePDFRelativePath, fileName: notebook.sourcePDFFileName),
            let image = renderPDFThumbnail(url: pdfURL, size: size, scale: scale) {
             return image
         }
@@ -203,7 +233,21 @@ final class NotebookThumbnailService {
         try? data.write(to: path, options: .atomic)
     }
 
-    private func localPDFURL(fileName: String?) -> URL? {
+    private func setMemoryCache(image: UIImage, key: String) {
+        memoryCache.setObject(image, forKey: key as NSString, cost: estimatedCost(of: image))
+        memoryKeys.insert(key)
+    }
+
+    private func localPDFURL(relativePath: String?, fileName: String?) -> URL? {
+        if let relativePath, !relativePath.isEmpty,
+           let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            let url = appSupport
+                .appendingPathComponent("HomeResources", isDirectory: true)
+                .appendingPathComponent(relativePath)
+            if fileManager.fileExists(atPath: url.path) {
+                return url
+            }
+        }
         guard let fileName, !fileName.isEmpty else { return nil }
         guard let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
             return nil
